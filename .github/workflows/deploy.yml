@@ -1,7 +1,5 @@
-# GitHub Actions 워크플로우 이름
 name: Docker 컨테이너로 EC2에 배포하기
 
-# main 브랜치에 push가 발생하면 이 워크플로우 실행
 on:
   push:
     branches:
@@ -9,68 +7,151 @@ on:
 
 jobs:
   deploy:
-    runs-on: ubuntu-latest  # GitHub 제공 Ubuntu 환경에서 실행
+    runs-on: ubuntu-latest
 
     steps:
       # 1. GitHub 저장소 코드 가져오기
       - name: Checkout source
         uses: actions/checkout@v4
 
-      # 2. Spring Boot 설정 파일(application.properties)을 생성
-      # GitHub Secrets에 저장된 문자열을 파일로 생성
-      - name: Create application.properties
-        run: echo "${{ secrets.APPLICATION_PROPERTIES }}" > ./src/main/resources/application.properties
+      # 2. docker-compose.yml 파일 생성 (필요한 경우만)
+      - name: Create docker-compose.yml
+        run: |
+          # docker-compose.yml 파일이 없으면 생성
+          if [ ! -f "docker-compose.yml" ]; then
+            echo "${{ secrets.DOCKER_COMPOSE }}" > ./docker-compose.yml
+          else
+            echo "docker-compose.yml already exists"
+          fi
 
-      # 3. docker-compose.yml 파일 생성
-      # GitHub Secrets에 저장된 내용 기반으로 로컬에 생성
-      - name: Create docker-compose.yml 생성
-        run: echo "${{ secrets.DOCKER_COMPOSE  }}" > ./docker-compose.yml
-
-      # 4. gradlew에 실행 권한 부여 (리눅스에서 실행되도록)
+      # 3. gradlew 실행 권한 부여
       - name: Gradlew 실행 권한 부여
         run: chmod +x ./gradlew
 
-      # 5. 프로젝트를 빌드 (클린 후 재빌드)
+      # 4. 프로젝트 빌드
       - name: Gradle 빌드 실행
         run: ./gradlew clean build
 
-      # 6. Docker Hub에 로그인 (푸시하기 위해 인증)
+      # 5. Docker Hub 로그인 (이미지 푸시를 원하지 않으면 이 단계 생략)
       - name: Docker Hub 로그인
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      # 7. 빌드된 JAR 파일을 포함한 Docker 이미지 생성
+      # 6. Docker 이미지 빌드
       - name: Docker 이미지 빌드
         run: docker build -t ${{ secrets.DOCKER_USERNAME }}/myapp:latest .
 
-      # 8. Docker Hub에 이미지 푸시 (EC2에서 사용하기 위해)
+      # 7. Docker Hub에 이미지 푸시 (선택사항)
       - name: Docker 이미지 푸시
         run: docker push ${{ secrets.DOCKER_USERNAME }}/myapp:latest
 
-      # 9. docker-compose.yml 파일을 EC2 서버로 복사
-      - name: docker-compose.yml 전송
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.EC2_HOST }}         # EC2 IP
-          username: ${{ secrets.EC2_USERNAME }} # EC2 사용자명 (보통 ubuntu)
-          key: ${{ secrets.EC2_PRIVATE_KEY }}   # EC2 접근용 개인키
-          source: "docker-compose.yml"          # 로컬에서 보낼 파일
-          target: "~/cicd-docker/"              # EC2 내 저장 위치
+      # 8. SSH 키 설정 및 테스트
+      - name: Setup and Test SSH Connection
+        run: |
+          # SSH 키 파일 생성
+          echo "${{ secrets.EC2_PRIVATE_KEY }}" > /tmp/ssh_key
+          chmod 600 /tmp/ssh_key
+          
+          # 키 형식 확인
+          echo "🔑 Checking SSH key format..."
+          ssh-keygen -l -f /tmp/ssh_key 2>/dev/null && echo "✅ Key format OK" || echo "❌ Key format issue"
+          
+          # 연결 테스트
+          echo "🔌 Testing SSH connection to ${{ secrets.EC2_HOST }}..."
+          ssh -o StrictHostKeyChecking=no \
+              -o ConnectTimeout=10 \
+              -o BatchMode=yes \
+              -i /tmp/ssh_key \
+              ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} \
+              "echo '✅ SSH connection successful'" && echo "✅ SSH test passed" || echo "❌ SSH test failed"
 
-      # 10. EC2에 접속하여 docker-compose 명령 실행
-      - name: EC2에서 컨테이너 실행
-        uses: appleboy/ssh-action@v1.0.3
+      # 9. 필요한 파일 EC2로 전송
+      - name: Transfer files to EC2
+        run: |
+          echo "📁 Transferring files to EC2..."
+          
+          # EC2에 디렉토리 생성
+          ssh -o StrictHostKeyChecking=no \
+              -i /tmp/ssh_key \
+              ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }} \
+              "mkdir -p ~/cicd-docker && cd ~/cicd-docker && pwd"
+          
+          # Dockerfile 전송 (존재하는 경우)
+          if [ -f "Dockerfile" ]; then
+            echo "📄 Sending Dockerfile..."
+            scp -o StrictHostKeyChecking=no \
+                -i /tmp/ssh_key \
+                Dockerfile \
+                ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:~/cicd-docker/
+          fi
+          
+          # docker-compose.yml 전송 (존재하는 경우)
+          if [ -f "docker-compose.yml" ]; then
+            echo "📄 Sending docker-compose.yml..."
+            scp -o StrictHostKeyChecking=no \
+                -i /tmp/ssh_key \
+                docker-compose.yml \
+                ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:~/cicd-docker/
+          fi
+          
+          # 빌드된 JAR 파일 전송
+          echo "📦 Sending JAR file..."
+          scp -o StrictHostKeyChecking=no \
+              -i /tmp/ssh_key \
+              build/libs/*.jar \
+              ${{ secrets.EC2_USERNAME }}@${{ secrets.EC2_HOST }}:~/cicd-docker/
+
+      # 10. EC2에서 애플리케이션 실행
+      - name: Deploy on EC2
+        uses: appleboy/ssh-action@master
         with:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_PRIVATE_KEY }}
-          script_stop: true
           script: |
-            mkdir -p ~/cicd-docker  # 배포 디렉토리 생성 (이미 있으면 무시)
+            echo "🚀 Starting deployment..."
             
+            # 작업 디렉토리로 이동
             cd ~/cicd-docker
-            docker compose down || true  # 기존 컨테이너 중지 (실패해도 계속)
-            docker compose pull          # 최신 이미지 가져오기
-            docker compose up -d         # 백그라운드에서 컨테이너 실행
+            
+            echo "📂 Current directory contents:"
+            ls -la
+            
+            echo "🐳 Checking Docker..."
+            docker --version
+            docker ps
+            
+            # 1. Docker Compose로 실행 (docker-compose.yml이 있는 경우)
+            if [ -f "docker-compose.yml" ]; then
+              echo "📋 Using docker-compose..."
+              docker compose down || true
+              docker compose up -d
+            else
+              # 2. 직접 Docker로 실행
+              echo "🔧 Running Docker directly..."
+              # 기존 컨테이너 중지
+              docker stop myapp-container 2>/dev/null || true
+              docker rm myapp-container 2>/dev/null || true
+            
+              # 새 컨테이너 실행
+              JAR_FILE=$(ls *.jar | head -1)
+              if [ -n "$JAR_FILE" ]; then
+                echo "📦 Found JAR file: $JAR_FILE"
+                docker run -d \
+                  --name myapp-container \
+                  -p 8080:8080 \
+                  -v $(pwd):/app \
+                  openjdk:11-jre-slim \
+                  java -jar /app/$JAR_FILE
+              else
+                echo "❌ No JAR file found!"
+                exit 1
+              fi
+            fi
+            
+            echo "✅ Deployment completed!"
+            echo "📊 Checking running containers:"
+            docker ps
+            echo "🌐 Application should be available at: http://$(curl -s ifconfig.me):8080"
